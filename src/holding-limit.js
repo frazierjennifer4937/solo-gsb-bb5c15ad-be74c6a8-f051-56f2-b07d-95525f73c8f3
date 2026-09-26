@@ -19,6 +19,16 @@
  *   道具，即标为「无法判定」（不把未知计为零）；无未知道具且已知持有数
  *   不超过上限时为「确定未超限」。
  * - 已知峰值：窗口内各状态点已知持有数的最大值，及达到峰值的连续分钟段。
+ *
+ * 实现要点（事件增量维护，不在每个状态点扫描全部道具及历史记录）：
+ * 1. 交接记录先按道具一次分组，各道具沿同分钟唯一链重放（只取窗口结束
+ *    分钟及以前的记录）；
+ * 2. 把「分钟末持有人变化」（同分钟链式交接只保留该分钟最终持有人）与
+ *    「首个冲突分钟」统一转换为按分钟排序的事件——前者是该道具在已知
+ *    持有人之间的一次增量迁移，后者把该道具迁入去向未知集合；
+ * 3. 按时间顺序增量维护该人员的「已知持有道具」与「去向未知道具」两个
+ *    集合，只在有事件的分钟切段、求值，每个事件对集合至多两次 O(1)
+ *    增删，处理量随记录数与状态点数近线性增长，与状态点上的道具总数无关。
  */
 
 const { WAREHOUSE, sortRecords, replayPropRecords } = require('./verify');
@@ -43,32 +53,49 @@ function investigateHoldingLimit(data, person, startMinute, endMinute, limit) {
   const props = data.props || [];
   const records = data.records || [];
 
-  // 逐件重放：只取窗口结束分钟（含）以前的记录，窗口外的后续冲突不影响本次结果
-  const timelines = [];
-  const conflicts = [];
-  const pointSet = new Set([startMinute]);
+  // 1) 交接记录按道具一次分组，只取窗口结束分钟（含）以前的记录；
+  //    窗口外的后续交接与冲突不影响本次结果（孤儿记录自然不进任何道具分组）
+  const recordsByProp = new Map(); // propId -> 该道具记录（保持原顺序，随后逐件排序）
+  for (const r of records) {
+    if (Number(r.minute) > endMinute) continue;
+    let arr = recordsByProp.get(r.propId);
+    if (!arr) {
+      arr = [];
+      recordsByProp.set(r.propId, arr);
+    }
+    arr.push(r);
+  }
 
-  for (const prop of props) {
-    const propRecords = sortRecords(
-      records.filter((r) => r.propId === prop.id && Number(r.minute) <= endMinute)
-    );
+  // 2) 逐件沿现有同分钟唯一链重放，转换为按分钟排序的事件：
+  //    HOLDER { minute, propIndex, holder }：该分钟全部交接完成后持有人变为 holder
+  //    UNKNOWN { minute, propIndex }：自该分钟（含）起道具去向未知（首个冲突分钟）
+  const events = [];
+  const conflicts = [];
+  const conflictMinuteByIndex = new Map(); // propIndex -> 首个冲突分钟（未知起点）
+
+  props.forEach((prop, propIndex) => {
+    const propRecords = sortRecords(recordsByProp.get(prop.id) || []);
     const replay = replayPropRecords(propRecords);
 
-    // 状态点序列：每个交接分钟全部交接完成后的持有人（同分钟链式交接只保留最终持有人）
-    const states = [];
+    // 同分钟链式交接只保留该分钟最终持有人；冲突分钟的最终状态即未知，
+    // 该分钟部分归约出的记录不再产生持有人事件（与「冲突分钟起未知」口径一致）。
+    // chain 按分钟升序，同分钟记录连续出现，只需回看本道具上一事件即可归并
+    let lastEvent = null;
     for (const rec of replay.chain) {
-      const last = states[states.length - 1];
-      if (last && last.minute === rec.minute) last.holder = rec.to;
-      else states.push({ minute: rec.minute, holder: rec.to });
-    }
-    for (const st of states) {
-      if (st.minute >= startMinute) pointSet.add(st.minute);
+      const minute = Number(rec.minute);
+      if (!replay.ok && minute === replay.conflict.minute) continue;
+      if (lastEvent && lastEvent.minute === minute) {
+        lastEvent.holder = rec.to;
+      } else {
+        lastEvent = { minute, propIndex, type: 'HOLDER', holder: rec.to };
+        events.push(lastEvent);
+      }
     }
 
-    const conflictMinute = replay.ok ? null : replay.conflict.minute;
-    // 冲突分钟也是状态边界：自该分钟（含）起该道具由已知变为未知
-    if (conflictMinute != null && conflictMinute >= startMinute) pointSet.add(conflictMinute);
     if (!replay.ok) {
+      const conflictMinute = Number(replay.conflict.minute);
+      events.push({ minute: conflictMinute, propIndex, type: 'UNKNOWN' });
+      conflictMinuteByIndex.set(propIndex, conflictMinute);
       conflicts.push({
         propId: prop.id,
         propName: prop.name,
@@ -78,68 +105,110 @@ function investigateHoldingLimit(data, person, startMinute, endMinute, limit) {
         conflictRecordIds: replay.conflict.records || [],
       });
     }
-    timelines.push({ propId: prop.id, propName: prop.name, states, conflictMinute });
+  });
+
+  // 事件按分钟排序（同分钟按道具，仅为处理顺序稳定）；随后单指针顺序消费
+  events.sort((a, b) => a.minute - b.minute || a.propIndex - b.propIndex);
+
+  // 3) 增量维护两个集合：
+  //    heldSet —— 当前状态点已知持有人恰为该人员的道具
+  //    unknownSet —— 自冲突分钟起去向未知的道具
+  // 每件道具初始持有人恒为「仓库」：查询仓库时起点前即持有全部道具
+  const heldSet = new Set();
+  const unknownSet = new Set();
+  if (person === WAREHOUSE) {
+    for (let i = 0; i < props.length; i += 1) heldSet.add(i);
   }
 
-  // 一件道具在状态点 m（第 m 分钟全部交接完成后）的持有人；自冲突分钟（含）起为未知（null）
-  function holderAt(tl, m) {
-    if (tl.conflictMinute != null && tl.conflictMinute <= m) return null;
-    let holder = WAREHOUSE;
-    for (const st of tl.states) {
-      if (st.minute > m) break;
-      holder = st.holder;
+  function applyEvent(ev) {
+    if (ev.type === 'UNKNOWN') {
+      heldSet.delete(ev.propIndex);
+      unknownSet.add(ev.propIndex);
+    } else {
+      unknownSet.delete(ev.propIndex);
+      if (ev.holder === person) heldSet.add(ev.propIndex);
+      else heldSet.delete(ev.propIndex);
     }
-    return holder;
   }
 
-  // 逐状态点求值；相邻同值（判定、持有集合、未知集合均相同）的状态点合并为连续分钟段
-  const points = [...pointSet].sort((a, b) => a - b);
-  const segments = [];
-  let peakCount = 0;
-
-  points.forEach((m, i) => {
-    const segEnd = i + 1 < points.length ? points[i + 1] : endMinute + 1;
-    const heldProps = [];
-    const unknownProps = [];
-    for (const tl of timelines) {
-      const h = holderAt(tl, m);
-      if (h === null) {
-        unknownProps.push({ propId: tl.propId, propName: tl.propName, conflictMinute: tl.conflictMinute });
-      } else if (h === person) {
-        heldProps.push({ propId: tl.propId, propName: tl.propName });
-      }
+  let eventPos = 0;
+  function applyAt(minute) {
+    while (eventPos < events.length && events[eventPos].minute === minute) {
+      applyEvent(events[eventPos]);
+      eventPos += 1;
     }
-    const knownCount = heldProps.length;
-    // 已知持有数已超上限：无论是否含未知道具均确定超限；
-    // 否则只要仍含未知道具即无法判定（未知不计为零）
+  }
+
+  // 窗口起始分钟之前的事件先重放完毕，得到起点交接前状态
+  while (eventPos < events.length && events[eventPos].minute < startMinute) {
+    applyEvent(events[eventPos]);
+    eventPos += 1;
+  }
+
+  // 状态点求值：由两个集合直接得到已知持有 / 未知清单（按下标序，即道具录入顺序）
+  function evaluate() {
+    const held = [...heldSet].sort((a, b) => a - b);
+    const unknown = [...unknownSet].sort((a, b) => a - b);
+    const knownCount = held.length;
     const status =
       knownCount > limit
         ? SEGMENT_STATUS.OVER
-        : unknownProps.length > 0
+        : unknown.length > 0
           ? SEGMENT_STATUS.UNKNOWN
           : SEGMENT_STATUS.OK;
-    if (knownCount > peakCount) peakCount = knownCount;
+    return { status, knownCount, held, unknown };
+  }
 
-    const sameProps = (a, b) =>
-      a.length === b.length && a.every((x, j) => x.propId === b[j].propId);
+  const sameSet = (seg, held, unknown) =>
+    seg.held.length === held.length &&
+    seg.unknown.length === unknown.length &&
+    held.every((idx) => seg.heldSet.has(idx)) &&
+    unknown.every((idx) => seg.unknownSet.has(idx));
+
+  // 逐事件分钟切段：只在有事件的分钟求值一次，不在状态点扫描全部道具及历史记录
+  const segments = [];
+  let peakCount = 0;
+
+  function openSegment(m) {
+    const ev = evaluate();
+    if (ev.knownCount > peakCount) peakCount = ev.knownCount;
+
     const last = segments[segments.length - 1];
-    if (
-      last &&
-      last.status === status &&
-      sameProps(last.props, heldProps) &&
-      sameProps(last.unknownProps, unknownProps)
-    ) {
-      last.endMinute = segEnd;
-    } else {
-      segments.push({
-        status,
-        startMinute: m,
-        endMinute: segEnd,
-        knownCount,
-        props: heldProps,
-        unknownProps,
-      });
+    // 相邻同值（判定、持有集合、未知集合均相同）的状态点合并为连续分钟段
+    if (last && last.status === ev.status && sameSet(last, ev.held, ev.unknown)) {
+      last.endMinute = endMinute + 1;
+      return;
     }
+    segments.push({
+      status: ev.status,
+      startMinute: m,
+      endMinute: endMinute + 1,
+      knownCount: ev.knownCount,
+      held: ev.held,
+      unknown: ev.unknown,
+      heldSet: new Set(ev.held),
+      unknownSet: new Set(ev.unknown),
+    });
+  }
+
+  // 窗口起始分钟：先应用该分钟全部交接（含冲突），再开第一段
+  applyAt(startMinute);
+  openSegment(startMinute);
+
+  // 其余状态点 = 窗口内其余有事件的分钟；每到一个事件分钟，关闭当前段后重算
+  while (eventPos < events.length) {
+    const minute = events[eventPos].minute; // 已 >= startMinute，且记录均 <= endMinute
+    segments[segments.length - 1].endMinute = minute;
+    applyAt(minute);
+    openSegment(minute);
+  }
+
+  // 以下输出口径与逐状态点扫描完全一致，仅把道具下标还原为道具信息
+  const toHeldProp = (idx) => ({ propId: props[idx].id, propName: props[idx].name });
+  const toUnknownProp = (idx) => ({
+    propId: props[idx].id,
+    propName: props[idx].name,
+    conflictMinute: conflictMinuteByIndex.get(idx),
   });
 
   const fmtRange = (s) => `第${s.startMinute}–${s.endMinute - 1}分钟`;
@@ -151,12 +220,12 @@ function investigateHoldingLimit(data, person, startMinute, endMinute, limit) {
       startMinute: s.startMinute,
       endMinute: s.endMinute,
       count: s.knownCount,
-      props: s.props,
-      unknownProps: s.unknownProps,
+      props: s.held.map(toHeldProp),
+      unknownProps: s.unknown.map(toUnknownProp),
       note:
         `${fmtRange(s)}已知确定持有 ${s.knownCount} 件，超过上限 ${limit} 件` +
-        (s.unknownProps.length
-          ? `；另有 ${s.unknownProps.length} 件道具自冲突分钟起去向未知，实际持有可能更多`
+        (s.unknown.length
+          ? `；另有 ${s.unknown.length} 件道具自冲突分钟起去向未知，实际持有可能更多`
           : '') +
         '。',
     }));
@@ -168,11 +237,16 @@ function investigateHoldingLimit(data, person, startMinute, endMinute, limit) {
       startMinute: s.startMinute,
       endMinute: s.endMinute,
       knownCount: s.knownCount,
-      knownProps: s.props,
-      unknownProps: s.unknownProps,
+      knownProps: s.held.map(toHeldProp),
+      unknownProps: s.unknown.map(toUnknownProp),
       note:
         `${fmtRange(s)}已知确定持有 ${s.knownCount} 件（未超过上限 ${limit} 件），但 ` +
-        `${s.unknownProps.map((u) => `「${u.propName}」自第${u.conflictMinute}分钟冲突起`).join('、')}` +
+        `${s.unknown
+          .map(
+            (idx) =>
+              `「${props[idx].name}」自第${conflictMinuteByIndex.get(idx)}分钟冲突起`
+          )
+          .join('、')}` +
         ' 去向未知，无法判定是否超限（未知不计为零）。',
     }));
 
