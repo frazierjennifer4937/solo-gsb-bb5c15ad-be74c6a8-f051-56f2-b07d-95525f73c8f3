@@ -247,4 +247,71 @@ test('持有上限：多冲突道具分别自各自冲突分钟起未知', () =>
   );
 });
 
+// 12. 仓库作为查询对象：全部道具初始在仓（已知持有），冲突道具自冲突分钟起离仓转未知
+test('持有上限：仓库作为查询对象时全部道具初始在仓', () => {
+  const data = mkData(['剑', '扇', '灯'], [
+    rec('p0', 2, WAREHOUSE, '张三'),
+    rec('p0', 5, '张三', WAREHOUSE),
+    rec('p1', 6, '张三', '李四'), // 断链：当前为仓库 -> 扇自第6分起未知（离开已知持有）
+    rec('p2', 1, WAREHOUSE, '李四'),
+    rec('p2', 3, '李四', '王五'), // 歧义：灯自第3分起未知（此前已交出，不在已知持有）
+    rec('p2', 3, '李四', '赵六'),
+  ]);
+  const r = investigateHoldingLimit(data, WAREHOUSE, 0, 8, 1);
+  // [0,1) 3 件超限；[1,2) 灯交出后 2 件超限；[2,3) 剑也交出后 1 件；
+  // [3,5) 灯未知、已知 1 件未超 -> 无法判定；[5,6) 剑归仓后已知 2 件超限（含未知）；
+  // [6,9) 扇也未知，已知 1 件未超 -> 无法判定
+  assert.deepStrictEqual(
+    r.overSegments.map((s) => [s.startMinute, s.endMinute, s.count, s.unknownProps.length]),
+    [[0, 1, 3, 0], [1, 2, 2, 0], [5, 6, 2, 1]]
+  );
+  assert.deepStrictEqual(
+    r.undeterminedSegments.map((u) => [u.startMinute, u.endMinute, u.knownCount, u.unknownProps.length]),
+    [[3, 5, 1, 1], [6, 9, 1, 2]]
+  );
+  // 未知道具按道具登记顺序输出（扇 p1 先于灯 p2），而非冲突分钟顺序
+  assert.deepStrictEqual(
+    r.undeterminedSegments[1].unknownProps.map((p) => [p.propName, p.conflictMinute]),
+    [['扇', 6], ['灯', 3]]
+  );
+  assert.strictEqual(r.peak.count, 3);
+  assert.deepStrictEqual(r.peak.segments, [{ startMinute: 0, endMinute: 1 }]);
+  assert.deepStrictEqual(
+    r.conflicts.map((c) => [c.propName, c.conflictMinute, c.conflictType]),
+    [['灯', 3, 'AMBIGUOUS'], ['扇', 6, 'BROKEN']]
+  );
+});
+
+// 13. 大量道具 × 大量交接分钟：按道具分组 + 事件扫描，不在每个状态点扫描全部道具及历史
+test('持有上限：大量道具与交接分钟按事件扫描完成（回归阈值）', () => {
+  const P = 1000; // 道具数
+  const J = 40; // 每件道具的交接次数（分钟互不相同）
+  const names = [];
+  for (let k = 0; k < P; k += 1) names.push(`道具${k}`);
+  const records = [];
+  for (let k = 0; k < P; k += 1) {
+    for (let j = 0; j < J; j += 1) {
+      const minute = j * P + k;
+      // 前 100 件在仓库与张三之间往返（产生持有事件）；
+      // 其余 900 件在仓库与李四之间往返（与该人员无关，不产生事件）
+      const other = k < 100 ? '张三' : '李四';
+      records.push(rec(`p${k}`, minute, j % 2 === 0 ? WAREHOUSE : other, j % 2 === 0 ? other : WAREHOUSE));
+    }
+  }
+  const data = mkData(names, records);
+  const startedAt = Date.now();
+  const r = investigateHoldingLimit(data, '张三', 0, P * J - 1, 10);
+  const elapsed = Date.now() - startedAt;
+  // 前 100 件在第 0–99 分钟全部交到张三手上：已知峰值 100 件，确定超限
+  assert.strictEqual(r.summary.totalProps, P);
+  assert.strictEqual(r.peak.count, 100);
+  assert.strictEqual(r.summary.hasOver, true);
+  assert.deepStrictEqual(
+    r.peak.segments[0],
+    { startMinute: 99, endMinute: 1000 }
+  );
+  // 旧的「每个状态点扫描全部道具及历史记录」实现同等规模需数十秒，留出充足余量
+  assert.ok(elapsed < 5000, `大量道具应按分组 + 事件扫描完成，实际耗时 ${elapsed}ms`);
+});
+
 console.log(`\n全部 ${passed} 个持有上限排查引擎测试通过 ✔`);
